@@ -11,7 +11,7 @@ From three input CSV matrices (genes x cells):
 1. Creates a Seurat object per sample (`SBC1`, `SBC3`, `SBC7`) and merges them.
 2. Computes mitochondrial fraction (`percent.mt`) using features matching `^MT.`.
 3. Filters cells with:
-   - `percent.mt < 0.4`
+   - `percent.mt < 25`
    - `1000 < nFeature_RNA < 10000`
 4. Joins layers (Seurat v5) after subsetting.
 5. Removes features whose names contain `SBC` (barcode-like artifacts) from the RNA assay.
