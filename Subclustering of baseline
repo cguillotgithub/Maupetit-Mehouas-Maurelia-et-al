@@ -1,0 +1,601 @@
+
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(readr)
+})
+
+# =========================================================
+# 1. Output folder
+# =========================================================
+out_dir <- "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/CODE SANITY/subclustering of baseline"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =========================================================
+# 2. Input files
+# =========================================================
+files_df <- data.frame(
+  obj_name = c(
+    "baseline",
+    "rpca_main", "rpca_s1", "rpca_s2",
+    "harmony_main", "harmony_s1", "harmony_s2"
+  ),
+  path = c(
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/fig5_no_integration/Seurat_noint_merged_singlets_clustered.rds",
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_integration v2/Seurat_SCT_RPCA_integrated.rds",
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_integration v2/Seurat_SCT_RPCA_sutil_1.rds",
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_integration v2/Seurat_SCT_RPCA_sutil_2.rds",
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_harmony v2/Seurat_SCT_Harmony_integrated.rds",
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_harmony v2/Seurat_SCT_Harmony_sutil_1.rds",
+    "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_harmony v2/Seurat_SCT_Harmony_sutil_2.rds"
+  ),
+  stringsAsFactors = FALSE
+)
+
+stopifnot(all(file.exists(files_df$path)))
+
+# =========================================================
+# 3. Parameters
+# =========================================================
+top_n_markers   <- 5
+min_pct_onlypos <- 0.25
+logfc_onlypos   <- 0.25
+preferred_fc_cols <- c("avg_log2FC", "avg_logFC")
+
+# =========================================================
+# 4. Helpers
+# =========================================================
+get_cluster_column <- function(seu, obj_name) {
+  md_cols <- colnames(seu@meta.data)
+  
+  if (obj_name == "baseline" && "seurat_clusters" %in% md_cols) {
+    return("seurat_clusters")
+  }
+  
+  if (grepl("^rpca_", obj_name) && "integrated_snn_res.0.18" %in% md_cols) {
+    return("integrated_snn_res.0.18")
+  }
+  
+  if (grepl("^harmony_", obj_name) && "SCT_snn_res.0.18" %in% md_cols) {
+    return("SCT_snn_res.0.18")
+  }
+  
+  if ("seurat_clusters" %in% md_cols) {
+    return("seurat_clusters")
+  }
+  
+  stop(paste("No suitable cluster column found for", obj_name))
+}
+
+get_fc_column <- function(marker_df) {
+  fc_col <- preferred_fc_cols[preferred_fc_cols %in% colnames(marker_df)][1]
+  if (is.na(fc_col)) stop("Could not find a logFC column in marker table.")
+  fc_col
+}
+
+# =========================================================
+# 5. Top 5 markers per cluster
+# =========================================================
+top_markers_list <- list()
+
+for (i in seq_len(nrow(files_df))) {
+  obj_name  <- files_df$obj_name[i]
+  file_path <- files_df$path[i]
+  
+  cat("\nProcessing:", obj_name, "\n")
+  
+  seu <- readRDS(file_path)
+  DefaultAssay(seu) <- "RNA"
+  
+  seu <- tryCatch(JoinLayers(seu), error = function(e) seu)
+  
+  cluster_col <- get_cluster_column(seu, obj_name)
+  Idents(seu) <- cluster_col
+  
+  markers <- FindAllMarkers(
+    seu,
+    assay = "RNA",
+    only.pos = TRUE,
+    min.pct = min_pct_onlypos,
+    logfc.threshold = logfc_onlypos
+  )
+  
+  if (nrow(markers) == 0) next
+  
+  fc_col <- get_fc_column(markers)
+  
+  markers$gene_use <- if ("gene" %in% colnames(markers)) markers$gene else rownames(markers)
+  
+  tmp <- markers %>%
+    mutate(
+      gene = gene_use,
+      cluster = as.character(cluster),
+      object = obj_name,
+      source_type = ifelse(obj_name == "baseline", "baseline", "integration")
+    ) %>%
+    arrange(cluster, desc(.data[[fc_col]]), desc(pct.1), p_val_adj) %>%
+    group_by(object, source_type, cluster) %>%
+    slice_head(n = top_n_markers) %>%
+    mutate(rank_within_cluster = row_number()) %>%
+    ungroup() %>%
+    select(object, source_type, cluster, rank_within_cluster, gene, all_of(fc_col), pct.1, pct.2, p_val_adj)
+  
+  top_markers_list[[obj_name]] <- tmp
+  
+  rm(seu, markers, tmp)
+  gc()
+}
+
+top_markers_df <- bind_rows(top_markers_list)
+
+# =========================================================
+# 6. Keep baseline genes preferentially
+# =========================================================
+baseline_genes <- top_markers_df %>%
+  filter(source_type == "baseline") %>%
+  pull(gene) %>%
+  unique()
+
+top_markers_dedup <- top_markers_df %>%
+  filter(
+    source_type == "baseline" |
+      (source_type == "integration" & !gene %in% baseline_genes)
+  )
+
+fc_col_final <- get_fc_column(top_markers_dedup)
+
+top_markers_final <- top_markers_dedup %>%
+  arrange(object, cluster, desc(.data[[fc_col_final]]), desc(pct.1), p_val_adj) %>%
+  group_by(object, source_type, cluster) %>%
+  mutate(rank_after_filter = row_number()) %>%
+  slice_head(n = top_n_markers) %>%
+  ungroup()
+
+# =========================================================
+# 7. Build DEG matrix
+# =========================================================
+deg_matrix <- top_markers_final %>%
+  mutate(
+    object_cluster = paste0(object, "_cl", cluster),
+    deg_col = paste0("DEG_", rank_after_filter)
+  ) %>%
+  select(object, source_type, cluster, object_cluster, deg_col, gene) %>%
+  pivot_wider(names_from = deg_col, values_from = gene) %>%
+  arrange(factor(object, levels = files_df$obj_name), as.numeric(cluster))
+
+# =========================================================
+# 8. Genes to plot
+# =========================================================
+deg_cols <- grep("^DEG_", colnames(deg_matrix), value = TRUE)
+
+genes_from_matrix <- deg_matrix %>%
+  select(all_of(deg_cols)) %>%
+  unlist(use.names = FALSE) %>%
+  unique()
+
+genes_from_matrix <- genes_from_matrix[!is.na(genes_from_matrix) & genes_from_matrix != ""]
+
+clusters_to_plot <- deg_matrix %>%
+  select(object, cluster) %>%
+  distinct() %>%
+  mutate(
+    cluster = as.character(cluster),
+    group_label = paste0(object, "_cl", cluster)
+  ) %>%
+  arrange(factor(object, levels = files_df$obj_name), as.numeric(cluster))
+
+# =========================================================
+# 10. Cluster identity mapping
+# =========================================================
+cluster_colors_list <- list(
+  baseline = c(
+    "0"  = "#2a9d8f", "1"  = "#a8dadc", "2"  = "#74c0fc",
+    "3"  = "#e63946", "4"  = "#b0b0b0", "5"  = "#8b0000",
+    "6"  = "#ffd166", "7"  = "#7b2cbf", "8"  = "#457b9d",
+    "9"  = "#1d3557", "10" = "#4a4a4a", "11" = "#e0ac69",
+    "12" = "#6d597a"
+  ),
+  harmony_main = c(
+    "0"  = "#2a9d8f", "1"  = "#a8dadc", "2"  = "#E6B3B3",
+    "3"  = "#74c0fc", "4"  = "#b0b0b0", "5"  = "#e63946",
+    "6"  = "#7b2cbf", "7"  = "#1d3557", "8"  = "#457b9d",
+    "9"  = "#4a4a4a", "10" = "#e0ac69"
+  ),
+  harmony_s1 = c(
+    "0"  = "#2a9d8f", "1"  = "#a8dadc", "2"  = "#E6B3B3",
+    "3"  = "#74c0fc", "4"  = "#e63946", "5"  = "#b0b0b0",
+    "6"  = "#7b2cbf", "7"  = "#1d3557", "8"  = "#457b9d",
+    "9"  = "#4a4a4a", "10" = "#e0ac69"
+  ),
+  harmony_s2 = c(
+    "0"  = "#a8dadc", "1"  = "#2a9d8f", "2"  = "#E6B3B3",
+    "3"  = "#e63946", "4"  = "#74c0fc", "5"  = "#b0b0b0",
+    "6"  = "#7b2cbf", "7"  = "#1d3557", "8"  = "#457b9d",
+    "9"  = "#4a4a4a", "10" = "#e0ac69"
+  ),
+  rpca_main = c(
+    "0"  = "#a8dadc", "1"  = "#2a9d8f", "2"  = "#E6B3B3",
+    "3"  = "#74c0fc", "4"  = "#b0b0b0", "5"  = "#e63946",
+    "6"  = "#ffd166", "7"  = "#7b2cbf", "8"  = "#457b9d",
+    "9"  = "#1d3557", "10" = "#4a4a4a", "11" = "#e0ac69",
+    "12" = "#000000"
+  ),
+  rpca_s1 = c(
+    "0"  = "#a8dadc", "1"  = "#2a9d8f", "2"  = "#E6B3B3",
+    "3"  = "#ffd166", "4"  = "#74c0fc", "5"  = "#b0b0b0",
+    "6"  = "#e63946", "7"  = "#7b2cbf", "8"  = "#457b9d",
+    "9"  = "#1d3557", "10" = "#4a4a4a", "11" = "#e0ac69",
+    "12" = "#000000"
+  ),
+  rpca_s2 = c(
+    "0"  = "#2a9d8f", "1"  = "#a8dadc", "2"  = "#E6B3B3",
+    "3"  = "#74c0fc", "4"  = "#b0b0b0", "5"  = "#e63946",
+    "6"  = "#7b2cbf", "7"  = "#457b9d", "8"  = "#1d3557",
+    "9"  = "#4a4a4a", "10" = "#e0ac69", "11" = "#000000"
+  )
+)
+
+baseline_colors <- cluster_colors_list$baseline
+baseline_color_to_cluster <- setNames(names(baseline_colors), baseline_colors)
+
+cluster_identity_map <- bind_rows(
+  lapply(names(cluster_colors_list), function(obj) {
+    tibble(
+      object = obj,
+      cluster = names(cluster_colors_list[[obj]]),
+      color = unname(cluster_colors_list[[obj]])
+    )
+  })
+) %>%
+  mutate(
+    baseline_cluster = unname(baseline_color_to_cluster[color]),
+    baseline_cluster = case_when(
+      color == "#E6B3B3" ~ "5",
+      color == "#000000" ~ "12",
+      TRUE ~ baseline_cluster
+    )
+  )
+
+group_meta <- clusters_to_plot %>%
+  mutate(cluster = as.character(cluster)) %>%
+  select(group_label, object, cluster)
+
+
+# =========================================================
+# 13. Baseline cluster-wise treatment DEGs (SBC3/SBC7 vs SBC1)
+# =========================================================
+
+baseline_path <- files_df$path[files_df$obj_name == "baseline"]
+
+seu_base <- readRDS(baseline_path)
+DefaultAssay(seu_base) <- "RNA"
+seu_base <- tryCatch(JoinLayers(seu_base), error = function(e) seu_base)
+
+Idents(seu_base) <- "seurat_clusters"
+
+condition_col <- "orig.ident"
+
+clusters <- levels(Idents(seu_base))
+
+deg_treatment_list <- list()
+
+for (cl in clusters) {
+  
+  cat("Cluster:", cl, "\n")
+  
+  cells_cl <- WhichCells(seu_base, idents = cl)
+  sub <- subset(seu_base, cells = cells_cl)
+  
+  cond_vec <- factor(as.character(sub@meta.data[[condition_col]]))
+  Idents(sub) <- cond_vec
+  
+  conditions_present <- levels(Idents(sub))
+  
+  # ---------------- SBC3 vs SBC1 ----------------
+  if (all(c("SBC1", "SBC3") %in% conditions_present)) {
+    
+    deg_3 <- FindMarkers(
+      sub,
+      ident.1 = "SBC3",
+      ident.2 = "SBC1",
+      assay = "RNA",
+      logfc.threshold = 0.25,
+      min.pct = 0.1
+    )
+    
+    deg_3$gene <- rownames(deg_3)
+    deg_3$cluster <- cl
+    deg_3$comparison <- "SBC3_vs_SBC1"
+    
+    deg_treatment_list[[paste0(cl, "_SBC3")]] <- deg_3
+  }
+  
+  # ---------------- SBC7 vs SBC1 ----------------
+  if (all(c("SBC1", "SBC7") %in% conditions_present)) {
+    
+    deg_7 <- FindMarkers(
+      sub,
+      ident.1 = "SBC7",
+      ident.2 = "SBC1",
+      assay = "RNA",
+      logfc.threshold = 0.25,
+      min.pct = 0.1
+    )
+    
+    deg_7$gene <- rownames(deg_7)
+    deg_7$cluster <- cl
+    deg_7$comparison <- "SBC7_vs_SBC1"
+    
+    deg_treatment_list[[paste0(cl, "_SBC7")]] <- deg_7
+  }
+}
+
+deg_treatment_df <- bind_rows(deg_treatment_list)
+
+# =========================================================
+# 1. Subset clusters 0, 3, 6
+# =========================================================
+clusters_to_sub <- c("0", "3", "6")
+sub_seu <- subset(seu_base, idents = clusters_to_sub)
+
+# =========================================================
+# 2. Preprocess: normalization, variable features, scaling
+# =========================================================
+DefaultAssay(sub_seu) <- "RNA"
+sub_seu <- NormalizeData(sub_seu)
+sub_seu <- FindVariableFeatures(sub_seu, selection.method = "vst", nfeatures = 2000)
+sub_seu <- ScaleData(sub_seu, features = rownames(sub_seu))
+
+# =========================================================
+# 3. Run PCA
+# =========================================================
+sub_seu <- RunPCA(sub_seu, features = VariableFeatures(sub_seu))
+
+# =========================================================
+# 4. Find neighbors and clusters (subclusters)
+# =========================================================
+sub_seu <- FindNeighbors(sub_seu, dims = 1:20)
+sub_seu <- FindClusters(sub_seu, resolution = 0.15)  # adjust resolution as needed
+
+# =========================================================
+# 5. Run UMAP
+# =========================================================
+sub_seu <- RunUMAP(sub_seu, dims = 1:20)
+
+# UMAP plot colored by subcluster
+DimPlot(sub_seu, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP of subclustered clusters 0, 3, 6, 7")
+# UMAP plot colored by subcluster
+DimPlot(sub_seu, reduction = "umap", split.by = "orig.ident", label = TRUE)
+
+
+
+
+
+# UMAP plot colored by subcluster
+DimPlot(sub_seu, reduction = "umap", label = TRUE) +
+  ggtitle("UMAP of subclustered clusters 0, 3, 6, 7")
+
+# Example: multiple features side by side
+FeaturePlot(
+  sub_seu,
+  features = c("TBXT", "SOX2", "MSGN1","PAX6","MEOX1"),
+  reduction = "umap",
+  pt.size = 1,
+  cols = c("lightgrey", "blue")
+)
+
+ ggtitle("UMAP of subclustered clusters 0, 3, 6, 7")
+
+# 6. DEG analysis for treatment within each subcluster
+Idents(sub_seu) <- "seurat_clusters"
+condition_col <- "orig.ident"
+sub_clusters <- levels(Idents(sub_seu))
+
+deg_sub_list <- list()
+
+for (cl in sub_clusters) {
+  
+  cat("Subcluster:", cl, "\n")
+  
+  cells_cl <- WhichCells(sub_seu, idents = cl)
+  sub <- subset(sub_seu, cells = cells_cl)
+  
+  # Make sure the cluster has enough cells for each comparison
+  cond_vec <- factor(as.character(sub@meta.data[[condition_col]]))
+  Idents(sub) <- cond_vec
+  conditions_present <- levels(Idents(sub))
+  
+  # SBC3 vs SBC1
+  if (all(c("SBC1", "SBC3") %in% conditions_present)) {
+    n_SBC1 <- sum(sub@meta.data[[condition_col]] == "SBC1")
+    n_SBC3 <- sum(sub@meta.data[[condition_col]] == "SBC3")
+    
+    if (n_SBC1 >= 3 & n_SBC3 >= 3) {
+      deg_3 <- FindMarkers(
+        sub, ident.1 = "SBC3", ident.2 = "SBC1",
+        assay = "RNA", logfc.threshold = 0.25, min.pct = 0.1
+      )
+      deg_3$gene <- rownames(deg_3)
+      deg_3$subcluster <- cl
+      deg_3$comparison <- "SBC3_vs_SBC1"
+      deg_sub_list[[paste0(cl, "_SBC3")]] <- deg_3
+    } else {
+      cat("Skipping SBC3 vs SBC1 in subcluster", cl, "- too few cells\n")
+    }
+  }
+  
+  # SBC7 vs SBC1
+  if (all(c("SBC1", "SBC7") %in% conditions_present)) {
+    n_SBC1 <- sum(sub@meta.data[[condition_col]] == "SBC1")
+    n_SBC7 <- sum(sub@meta.data[[condition_col]] == "SBC7")
+    
+    if (n_SBC1 >= 3 & n_SBC7 >= 3) {
+      deg_7 <- FindMarkers(
+        sub, ident.1 = "SBC7", ident.2 = "SBC1",
+        assay = "RNA", logfc.threshold = 0.25, min.pct = 0.1
+      )
+      deg_7$gene <- rownames(deg_7)
+      deg_7$subcluster <- cl
+      deg_7$comparison <- "SBC7_vs_SBC1"
+      deg_sub_list[[paste0(cl, "_SBC7")]] <- deg_7
+    } else {
+      cat("Skipping SBC7 vs SBC1 in subcluster", cl, "- too few cells\n")
+    }
+  }
+}
+
+# Combine all DEGs
+deg_sub_df <- bind_rows(deg_sub_list)
+
+# Detect logFC column automatically
+fc_col_deg <- preferred_fc_cols[preferred_fc_cols %in% colnames(deg_sub_df)][1]
+if (is.na(fc_col_deg)) stop("No logFC column found in deg_sub_df")
+
+# =========================================================
+# Count DEGs per subcluster normalized by cluster size
+# =========================================================
+subcluster_sizes <- data.frame(
+  subcluster = levels(Idents(sub_seu)),
+  n_cells = sapply(levels(Idents(sub_seu)), function(cl) length(WhichCells(sub_seu, idents = cl)))
+)
+
+deg_sub_counts <- deg_sub_df %>%
+  filter(p_val_adj < 0.01) %>%
+  mutate(direction = ifelse(.data[[fc_col_deg]] > 0, "up", "down")) %>%
+  group_by(subcluster, comparison, direction) %>%
+  summarise(n_genes = n(), .groups = "drop") %>%
+  left_join(subcluster_sizes, by = c("subcluster")) %>%
+  mutate(n_plot = ifelse(direction == "down", -n_genes / n_cells, n_genes / n_cells))
+
+# Rank subclusters by total normalized DEGs
+subcluster_order <- deg_sub_counts %>%
+  group_by(subcluster) %>%
+  summarise(total_norm = sum(abs(n_plot)), .groups = "drop") %>%
+  arrange(desc(total_norm)) %>%
+  pull(subcluster)
+
+deg_sub_counts <- deg_sub_counts %>%
+  mutate(subcluster = factor(subcluster, levels = subcluster_order))
+
+# =========================================================
+# Plot horizontal bar plot of normalized DEGs per subcluster
+# =========================================================
+p_deg_sub_norm <- ggplot(deg_sub_counts, aes(y = subcluster, x = n_plot, fill = comparison)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("SBC3_vs_SBC1" = "orange", "SBC7_vs_SBC1" = "darkblue")) +
+  labs(
+    title = "Treatment-induced DEGs per subcluster (normalized by cluster size)",
+    x = "Normalized number of significant genes (left = down, right = up)",
+    y = "Subcluster"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_deg_sub_norm
+
+# Save figure
+ggsave(
+  file.path(out_dir, "subclustered_treatment_ranked_DEGs_norm.pdf"),
+  p_deg_sub_norm,
+  width = 10, height = 7
+)
+
+
+# =========================================================
+# 5. Count up/down genes per subcluster
+# =========================================================
+deg_sub_counts_plot <- deg_sub_df %>%
+  filter(p_val_adj < 0.01) %>%
+  mutate(direction = ifelse(.data[[fc_col_deg]] > 0, "up", "down")) %>%
+  group_by(subcluster, comparison, direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = direction, values_from = n, values_fill = 0) %>%
+  mutate(total_changed = up + down)
+
+# =========================================================
+# 6. Rank subclusters by total transcriptional changes
+# =========================================================
+subcluster_order <- deg_sub_counts_plot %>%
+  group_by(subcluster) %>%
+  summarise(total = max(total_changed), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  pull(subcluster)
+
+deg_sub_plot_long <- deg_sub_counts_plot %>%
+  select(subcluster, comparison, up, down) %>%
+  pivot_longer(cols = c(up, down), names_to = "direction", values_to = "n") %>%
+  mutate(
+    n_plot = ifelse(direction == "down", -n, n),
+    subcluster = factor(subcluster, levels = subcluster_order)
+  )
+
+# =========================================================
+# 7. Horizontal ranked bar plot per subcluster
+# =========================================================
+p_deg_sub_ranked <- ggplot(deg_sub_plot_long, aes(y = subcluster, x = n_plot, fill = comparison)) +
+  geom_col(position = position_dodge(width = 0.8)) +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("SBC3_vs_SBC1" = "orange", "SBC7_vs_SBC1" = "darkblue")) +
+  labs(
+    title = "Treatment-responsive subclusters ranked by DEG burden",
+    x = "Number of significant genes (left = down, right = up)",
+    y = "Subcluster"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_deg_sub_ranked
+
+# Save the plot
+ggsave(
+  file.path(out_dir, "subclustered_treatment_ranked_DEGs_horizontal.pdf"),
+  p_deg_sub_ranked,
+  width = 10, height = 7
+)
+
+
+
+# =========================================================
+# 17. Count up/down genes per subcluster
+# =========================================================
+deg_sub_counts_plot2 <- deg_sub_df %>%
+  filter(p_val_adj < 0.05) %>%
+  mutate(direction = ifelse(.data[[fc_col_deg]] > 0, "up", "down")) %>%
+  group_by(subcluster, comparison, direction) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(n_plot = ifelse(direction == "down", -n, n))
+
+# =========================================================
+# 18. Plot up/down DEGs per subcluster
+# =========================================================
+p_deg_sub_direction <- ggplot(
+  deg_sub_counts_plot2,
+  aes(
+    x = factor(subcluster),
+    y = n_plot,
+    fill = comparison
+  )
+) +
+  geom_col(position = "dodge") +
+  facet_wrap(~direction, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values = c("SBC3_vs_SBC1" = "orange", "SBC7_vs_SBC1" = "darkblue")) +
+  labs(
+    title = "Treatment-induced DEGs per subcluster",
+    x = "Subcluster",
+    y = "Number of significant genes"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p_deg_sub_direction
+
+# Save the plot
+ggsave(
+  file.path(out_dir, "subclustered_treatment_up_down_DEGs.pdf"),
+  p_deg_sub_direction,
+  width = 10,
+  height = 6
+)
