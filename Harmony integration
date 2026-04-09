@@ -1,0 +1,219 @@
+---
+title: "Harmony integration"
+author: "FELIPE MAURELIA"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(1)
+
+suppressPackageStartupMessages({
+  library(future)
+  library(future.apply)
+  library(Seurat)
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(harmony)
+})
+
+options(future.globals.maxSize = 16 * 1024^3)
+future::plan(future::sequential)
+
+# -------------------------
+# Absolute paths
+# -------------------------
+out_dir_A <- "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/fig5_no_integration"
+
+rds_clustered <- file.path(out_dir_A, "Seurat_noint_merged_singlets_clustered.rds")
+rds_singlets  <- file.path(out_dir_A, "Seurat_noint_merged_singlets.rds")
+
+out_dir_H <- "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_harmony v2"
+dir.create(out_dir_H, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(rds_clustered))
+stopifnot(file.exists(rds_singlets))
+```
+
+
+```{r harmony integration, include=FALSE}
+# =========================================================
+# Harmony integration with downstream params matched to baseline
+# =========================================================
+
+# ---- Baseline-matched downstream parameters ----
+pca_npcs           <- 50
+dims_use           <- 1:20
+umap_neighbors     <- 50
+cluster_resolution <- 0.18
+seed_use           <- 1
+
+# ---- Load objects separately ----
+# lighter object for integration
+input_singlets <- readRDS(rds_singlets)
+DefaultAssay(input_singlets) <- "RNA"
+
+# ensure normalized RNA layer exists
+if (!"data" %in% Layers(input_singlets[["RNA"]])) {
+  input_singlets <- NormalizeData(input_singlets)
+}
+
+# clustered reference only for labels
+ref_clustered <- readRDS(rds_clustered)
+DefaultAssay(ref_clustered) <- "RNA"
+
+if (!"seurat_clusters" %in% colnames(ref_clustered[[]])) {
+  ref_clustered$seurat_clusters <- as.character(Idents(ref_clustered))
+}
+ref_clustered$clusters_noint <- ref_clustered$seurat_clusters
+
+# keep metadata lean in input object
+keep_md <- c(
+  "orig.ident", "nCount_RNA", "nFeature_RNA", "percent.mt",
+  "scDblFinder.class", "scDblFinder.score"
+)
+keep_md <- intersect(keep_md, colnames(input_singlets@meta.data))
+input_singlets@meta.data <- input_singlets@meta.data[, keep_md, drop = FALSE]
+
+# Named vector of baseline labels by cell
+ref_labels <- ref_clustered$clusters_noint
+names(ref_labels) <- colnames(ref_clustered)
+
+# ---- Harmony configs ----
+# Puedes ajustar theta para más o menos corrección
+harmony_configs <- list(
+  list(tag = "integrated", theta = 2, lambda = 1, sigma = 0.1, nclust = 50),
+  list(tag = "sutil_1",    theta = 1, lambda = 1, sigma = 0.1, nclust = 50),
+  list(tag = "sutil_2",    theta = 3, lambda = 1, sigma = 0.1, nclust = 50)
+)
+
+run_one_harmony <- function(cfg, input_obj, ref_labels, out_dir_H) {
+
+  cat("\n=============================\n")
+  cat("Running Harmony config:", cfg$tag, "\n")
+  cat("=============================\n")
+
+  obj <- input_obj
+
+  DefaultAssay(obj) <- "RNA"
+
+  # SCTransform on full object
+  obj <- SCTransform(
+    obj,
+    verbose = FALSE,
+    conserve.memory = TRUE
+  )
+
+  # PCA before Harmony
+  obj <- RunPCA(
+    obj,
+    npcs = pca_npcs,
+    verbose = FALSE
+  )
+
+# Harmony correction
+obj <- RunHarmony(
+  object        = obj,
+  group.by.vars = "orig.ident",
+  reduction.use = "pca",
+  dims.use      = dims_use,
+  theta         = cfg$theta,
+  lambda        = cfg$lambda,
+  sigma         = cfg$sigma,
+  nclust        = cfg$nclust,
+  assay.use     = "SCT",
+  reduction.save = "harmony",
+  verbose       = FALSE
+)
+
+  # inherit baseline cluster labels by cell name
+  obj$clusters_noint <- ref_labels[colnames(obj)]
+
+  # downstream matched to no-integration pipeline
+  DefaultAssay(obj) <- "SCT"
+  obj <- FindNeighbors(obj, reduction = "harmony", dims = dims_use)
+  obj <- FindClusters(obj, resolution = cluster_resolution, random.seed = seed_use)
+  obj <- RunUMAP(
+    obj,
+    reduction   = "harmony",
+    dims        = dims_use,
+    n.neighbors = umap_neighbors,
+    seed.use    = seed_use
+  )
+
+  outfile <- file.path(out_dir_H, paste0("Seurat_SCT_Harmony_", cfg$tag, ".rds"))
+  saveRDS(obj, outfile)
+
+  cat("\nSaved:", outfile, "\n")
+  print(table(obj$clusters_noint, useNA = "ifany"))
+  cat("\nCurrent Harmony clusters:\n")
+  print(table(obj$SCT_snn_res.0.18, useNA = "ifany"))
+
+  # simple UMAP by sample
+  p_umap_sample <- DimPlot(obj, group.by = "orig.ident", pt.size = 0.4) +
+    ggtitle(paste("Harmony:", cfg$tag))
+  ggsave(
+    filename = file.path(out_dir_H, paste0("umap_harmony_", cfg$tag, "_by_sample.pdf")),
+    plot = p_umap_sample,
+    width = 7,
+    height = 6
+  )
+
+  # simple UMAP by clusters
+  p_umap_cluster <- DimPlot(obj, group.by = "SCT_snn_res.0.18", label = TRUE, pt.size = 0.4) +
+    ggtitle(paste("Harmony clusters:", cfg$tag))
+  ggsave(
+    filename = file.path(out_dir_H, paste0("umap_harmony_", cfg$tag, "_by_cluster.pdf")),
+    plot = p_umap_cluster,
+    width = 7,
+    height = 6
+  )
+
+  rm(obj)
+  gc()
+
+  return(outfile)
+}
+
+# Run sequentially, saving each object to disk
+harmony_files <- vector("character", length(harmony_configs))
+names(harmony_files) <- vapply(harmony_configs, `[[`, "", "tag")
+
+for (i in seq_along(harmony_configs)) {
+  harmony_files[i] <- run_one_harmony(
+    cfg       = harmony_configs[[i]],
+    input_obj = input_singlets,
+    ref_labels = ref_labels,
+    out_dir_H = out_dir_H
+  )
+  gc()
+}
+
+cat("\nSaved Harmony files:\n")
+print(harmony_files)
+```
+
+
+
+```{r metrics, include=FALSE}
+
+# Optional: reload main Harmony object for quick inspection
+harmony_main <- readRDS(file.path(out_dir_H, "Seurat_SCT_Harmony_integrated.rds"))
+harmony_s1   <- readRDS(file.path(out_dir_H, "Seurat_SCT_Harmony_sutil_1.rds"))
+harmony_s2   <- readRDS(file.path(out_dir_H, "Seurat_SCT_Harmony_sutil_2.rds"))
+
+cat("\n=== harmony_main assays ===\n")
+print(names(harmony_main@assays))
+
+cat("\n=== harmony_main reductions ===\n")
+print(names(harmony_main@reductions))
+
+cat("\n=== harmony_main baseline labels ===\n")
+print(table(harmony_main$clusters_noint, useNA = "ifany"))
+
+cat("\n=== harmony_main current clusters ===\n")
+print(table(harmony_main$SCT_snn_res.0.18, useNA = "ifany"))
+```
