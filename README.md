@@ -2,7 +2,7 @@
 
 # Figure 5 — No integration (Seurat + scDblFinder)
 
-This repository contains the R Markdown workflow used to generate **Figure 5 (no integration)** from three scRNA-seq count matrices (CSV), using a standard Seurat pipeline (LogNormalize → HVGs → scaling → PCA → neighbors/clusters → UMAP) followed by **doublet detection with scDblFinder** and downstream plotting/exports.
+This repository contains the R Markdown workflow used to generate **the integrated and non-integrated objects** from three scRNA-seq count matrices (CSV), using a standard Seurat pipeline (LogNormalize → HVGs → scaling → PCA → neighbors/clusters → UMAP) followed by **doublet detection with scDblFinder** and downstream plotting/exports.
 
 ## What this does
 
