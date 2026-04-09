@@ -1,0 +1,196 @@
+---
+title: "RPCA integration"
+author: "FELIPE MAURELIA"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+set.seed(1)
+```
+
+
+
+```{r databases}
+
+suppressPackageStartupMessages({
+  library(future)
+  library(future.apply)
+  library(Seurat)
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+})
+
+options(future.globals.maxSize = 16 * 1024^3)
+future::plan(future::sequential)
+
+# -------------------------
+# Absolute paths
+# -------------------------
+out_dir_A <- "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/fig5_no_integration"
+rds_clustered <- file.path(out_dir_A, "Seurat_noint_merged_singlets_clustered.rds")
+rds_singlets  <- file.path(out_dir_A, "Seurat_noint_merged_singlets.rds")
+
+
+out_dir_B <- "/Users/fmaurelia/Documents/CODE REPOSITORIES/Paper-with-Stephanie/reports/results/Fig5_integration v2"
+dir.create(out_dir_B, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r SCT_plus_RPCA_integration_matched_to_baseline}
+# =========================================================
+# RPCA integration with downstream params matched to baseline
+# =========================================================
+
+# ---- Baseline-matched downstream parameters ----
+pca_npcs           <- 50
+dims_use           <- 1:20
+umap_neighbors     <- 50
+cluster_resolution <- 0.18
+seed_use           <- 1
+
+# ---- Load objects separately ----
+# lighter object for integration
+input_singlets <- readRDS(rds_singlets)
+DefaultAssay(input_singlets) <- "RNA"
+
+if (!"data" %in% Layers(input_singlets[["RNA"]])) {
+  input_singlets <- NormalizeData(input_singlets)
+}
+
+# clustered reference only for labels + UMAP model
+ref_clustered <- readRDS(rds_clustered)
+DefaultAssay(ref_clustered) <- "RNA"
+
+if (!"seurat_clusters" %in% colnames(ref_clustered[[]])) {
+  ref_clustered$seurat_clusters <- as.character(Idents(ref_clustered))
+}
+ref_clustered$clusters_noint <- ref_clustered$seurat_clusters
+
+ref_umap_model <- ref_clustered[["umap"]]@misc$model
+
+# keep metadata lean in input object
+keep_md <- c(
+  "orig.ident", "nCount_RNA", "nFeature_RNA", "percent.mt",
+  "scDblFinder.class", "scDblFinder.score"
+)
+keep_md <- intersect(keep_md, colnames(input_singlets@meta.data))
+input_singlets@meta.data <- input_singlets@meta.data[, keep_md, drop = FALSE]
+
+# ---- RPCA configs ----
+configs <- list(
+  list(tag = "integrated", nfeatures = 2000, k.anchor = 5, k.filter = 50,  k.weight = 25),
+  list(tag = "sutil_1",    nfeatures = 1800, k.anchor = 5, k.filter = 40,  k.weight = 20),
+  list(tag = "sutil_2",    nfeatures = 2500, k.anchor = 5, k.filter = 100, k.weight = 50)
+)
+
+run_one_rpca <- function(cfg, input_obj, ref_labels, ref_umap, out_dir_B) {
+
+  cat("\n=============================\n")
+  cat("Running config:", cfg$tag, "\n")
+  cat("=============================\n")
+
+  obj_list <- SplitObject(input_obj, split.by = "orig.ident")
+
+obj_list <- lapply(obj_list, function(x) {
+  DefaultAssay(x) <- "RNA"
+  x <- SCTransform(
+    x,
+    verbose = FALSE,
+    conserve.memory = TRUE
+  )
+  x
+})
+
+features <- SelectIntegrationFeatures(
+  object.list = obj_list,
+  nfeatures   = cfg$nfeatures
+)
+
+obj_list <- PrepSCTIntegration(
+  object.list     = obj_list,
+  anchor.features = features
+)
+
+# ESTA PARTE FALTABA
+obj_list <- lapply(obj_list, function(x) {
+  x <- RunPCA(
+    x,
+    features = features,
+    npcs = max(dims_use),
+    verbose = FALSE
+  )
+  x
+})
+
+anchors <- FindIntegrationAnchors(
+  object.list           = obj_list,
+  normalization.method  = "SCT",
+  anchor.features       = features,
+  dims                  = dims_use,
+  reduction             = "rpca",
+  k.anchor              = cfg$k.anchor,
+  k.filter              = cfg$k.filter
+)
+
+  obj <- IntegrateData(
+    anchorset            = anchors,
+    normalization.method = "SCT",
+    dims                 = dims_use,
+    k.weight             = cfg$k.weight
+  )
+
+  # inherit baseline cluster labels by cell name
+  obj$clusters_noint <- ref_labels[colnames(obj)]
+
+  # downstream matched to no-integration pipeline
+  DefaultAssay(obj) <- "integrated"
+  obj <- RunPCA(obj, npcs = pca_npcs, verbose = FALSE)
+  obj <- FindNeighbors(obj, reduction = "pca", dims = dims_use)
+  obj <- FindClusters(obj, resolution = cluster_resolution, random.seed = seed_use)
+
+  obj <- RunUMAP(
+    obj,
+    reduction   = "pca",
+    dims        = dims_use,
+    n.neighbors = umap_neighbors,
+    seed.use    = seed_use,
+    umap.model  = ref_umap
+  )
+
+  outfile <- file.path(out_dir_B, paste0("Seurat_SCT_RPCA_", cfg$tag, ".rds"))
+  saveRDS(obj, outfile)
+
+  cat("\nSaved:", outfile, "\n")
+  print(table(obj$clusters_noint, useNA = "ifany"))
+
+  # release memory aggressively
+  rm(obj_list, features, anchors, obj)
+  gc()
+
+  return(outfile)
+}
+
+# Named vector of baseline labels by cell
+ref_labels <- ref_clustered$clusters_noint
+names(ref_labels) <- colnames(ref_clustered)
+
+# Run sequentially, saving each object to disk instead of keeping all in RAM
+rpca_files <- vector("character", length(configs))
+names(rpca_files) <- vapply(configs, `[[`, "", "tag")
+
+for (i in seq_along(configs)) {
+  rpca_files[i] <- run_one_rpca(
+    cfg       = configs[[i]],
+    input_obj = input_singlets,
+    ref_labels = ref_labels,
+    ref_umap  = ref_umap_model,
+    out_dir_B = out_dir_B
+  )
+  gc()
+}
+
+print(rpca_files)
+```
